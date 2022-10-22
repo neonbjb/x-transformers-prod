@@ -8,6 +8,7 @@ from collections import namedtuple
 
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
+from torch.utils import checkpoint
 
 from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
 
@@ -811,6 +812,7 @@ class AttentionLayers(nn.Module):
         shift_tokens = 0,
         sandwich_norm = False,
         zero_init_branch_output = False,
+        enable_checkpointing = False,
         **kwargs
     ):
         super().__init__()
@@ -821,6 +823,7 @@ class AttentionLayers(nn.Module):
 
         self.dim = dim
         self.depth = depth
+        self.enable_checkpointing = enable_checkpointing
         self.layers = nn.ModuleList([])
 
         self.has_pos_emb = position_infused_attn or rel_pos_bias or rotary_pos_emb
@@ -952,6 +955,47 @@ class AttentionLayers(nn.Module):
             init_gain = (8 * depth) ** -0.25
             deepnorm_init(self, init_gain)
 
+    def _layer_fn(self, layer_type, layer_components, x, mems, rotary_pos_emb, prev_attn, mask, prev_cross_attn, context,
+                  attn_mask, context_mask):
+        norm, block, residual_fn = layer_components
+
+        if layer_type == 'a':
+            layer_mem = mems.pop(0) if mems else None
+            hidden = x
+
+        residual = x
+
+        pre_branch_norm, post_branch_norm, post_main_norm = norm
+
+        if exists(pre_branch_norm):
+            x = pre_branch_norm(x)
+
+        if layer_type == 'a':
+            out, inter = block(x, mask=mask, attn_mask=attn_mask, sinusoidal_emb=self.pia_pos_emb, rel_pos=self.rel_pos,
+                               rotary_pos_emb=rotary_pos_emb, prev_attn=prev_attn, mem=layer_mem)
+        elif layer_type == 'c':
+            out, inter = block(x, context=context, mask=mask, context_mask=context_mask, prev_attn=prev_cross_attn)
+        elif layer_type == 'f':
+            out = block(x)
+
+        if exists(post_branch_norm):
+            out = post_branch_norm(out)
+
+        x = residual_fn(out, residual)
+
+        if layer_type in ('a', 'c') and return_hiddens:
+            intermediates.append(inter)
+
+        if layer_type == 'a' and self.residual_attn:
+            prev_attn = inter.pre_softmax_attn
+        elif layer_type == 'c' and self.cross_residual_attn:
+            prev_cross_attn = inter.pre_softmax_attn
+
+        if exists(post_main_norm):
+            x = post_main_norm(x)
+
+        return x, hidden, inter, prev_attn, prev_cross_attn
+
     def forward(
         self,
         x,
@@ -976,43 +1020,17 @@ class AttentionLayers(nn.Module):
             max_rotary_emb_length = max(list(map(lambda m: (m.shape[1] if exists(m) else 0) + x.shape[1], mems)))
             rotary_pos_emb = self.rotary_pos_emb(max_rotary_emb_length, x.device)
 
-        for ind, (layer_type, (norm, block, residual_fn)) in enumerate(zip(self.layer_types, self.layers)):
-            is_last = ind == (len(self.layers) - 1)
-
-            if layer_type == 'a':
-                if return_hiddens:
-                    hiddens.append(x)
-                layer_mem = mems.pop(0) if mems else None
-
-            residual = x
-
-            pre_branch_norm, post_branch_norm, post_main_norm = norm
-
-            if exists(pre_branch_norm):
-                x = pre_branch_norm(x)
-
-            if layer_type == 'a':
-                out, inter = block(x, mask = mask, attn_mask = attn_mask, sinusoidal_emb = self.pia_pos_emb, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, mem = layer_mem)
-            elif layer_type == 'c':
-                out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn)
-            elif layer_type == 'f':
-                out = block(x)
-
-            if exists(post_branch_norm):
-                out = post_branch_norm(out)
-
-            x = residual_fn(out, residual)
-
-            if layer_type in ('a', 'c') and return_hiddens:
+        for ind, (layer_type, layer_components) in enumerate(zip(self.layer_types, self.layers)):
+            if self.enable_checkpointing:
+                layer_fn = partial(checkpoint, self._layer_fn)
+            else:
+                layer_fn = self._layer_fn
+            h, x, inter, prev_attn, prev_cross_attn = layer_fn(layer_type, layer_components, x, mems,
+                                                               rotary_pos_emb, prev_attn, mask, prev_cross_attn,
+                                                               context, attn_mask, context_mask)
+            if return_hiddens:
+                hiddens.append(h)
                 intermediates.append(inter)
-
-            if layer_type == 'a' and self.residual_attn:
-                prev_attn = inter.pre_softmax_attn
-            elif layer_type == 'c' and self.cross_residual_attn:
-                prev_cross_attn = inter.pre_softmax_attn
-
-            if exists(post_main_norm):
-                x = post_main_norm(x)
 
         if return_hiddens:
             intermediates = LayerIntermediates(
