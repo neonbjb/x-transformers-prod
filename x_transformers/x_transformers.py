@@ -10,7 +10,7 @@ from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 from torch.utils import checkpoint
 
-from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
+from autoregressive_wrapper import AutoregressiveWrapper
 
 # constants
 
@@ -510,8 +510,6 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.ff(x)
 
-# attention.
-
 class Attention(nn.Module):
     def __init__(
         self,
@@ -535,7 +533,8 @@ class Attention(nn.Module):
         shared_kv = False,
         sub_ln = False,          # sub-layernorm from https://arxiv.org/abs/2210.06423 - `attn_sub_ln = True`
         value_dim_head = None,
-        tensor_product = False   # https://arxiv.org/abs/2208.06061
+        tensor_product = False,   # https://arxiv.org/abs/2208.06061
+        use_flash_attention = False,
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -543,6 +542,7 @@ class Attention(nn.Module):
         self.heads = heads
         self.causal = causal
         self.max_attend_past = max_attend_past
+        self.use_flash_attn = use_flash_attention
 
         value_dim_head = default(value_dim_head, dim_head)
         q_dim = k_dim = dim_head * heads
@@ -684,72 +684,104 @@ class Attention(nn.Module):
             q, k = map(qk_l2norm, (q, k))
             scale = self.qk_norm_scale
 
-        kv_einsum_eq = 'b h j d' if not self.one_kv_head else 'b j d'
+        if self.use_flash_attn:
+            # Flash Attention only supports a small subset of the available attention options. Assert that all the others
+            # are unused.
+            assert not exists(rel_pos), 'Flash Attention does not support relative positional embeddings.'
+            assert attn_mask is None, 'Flash attention does not support custom masking (but does support causal masking)'
+            assert input_mask is None, 'Flash attention does not support masking. Pad masking can be supported using the `cu_seqlens` argument, but is not currently added.'
+            assert not exists(self.max_attend_past), 'Flash attention does not support attending to past pre-computed attention matrices'
+            assert not exists(self.sparse_topk), 'Flash attention does not support sparse top-k attention'
+            assert not talking_heads, 'Flash attention is incompatible with talking heads'
+            from flash_attn.flash_attn_interface import flash_attn_unpadded_func
+            orig_dtype = q.dtype
 
-        dots = einsum(f'b h i d, {kv_einsum_eq} -> b h i j', q, k) * scale
+            if self.one_kv_head:
+                # This is considerably less efficient with flash attention.
+                k = k.unsqueeze(1).repeat(1, h, 1, 1)
+                v = v.unsqueeze(1).repeat(1, h, 1, 1)
 
-        mask_value = max_neg_value(dots)
+            def permute_to_flash_attn(t_):
+                return rearrange(t_, 'b h s d -> (b s) h d').half()
+            q_, k_, v_ = map(permute_to_flash_attn, (q, k, v))
+            q_sequence_lens = torch.arange(
+                0, (b + 1) * q.shape[2], step=q.shape[2], dtype=torch.int32, device=q.device
+            )
+            k_sequence_lens = torch.arange(
+                0, (b + 1) * k.shape[2], step=k.shape[2], dtype=torch.int32, device=k.device
+            )
+            out = flash_attn_unpadded_func(q_, k_, v_, cu_seqlens_q=q_sequence_lens, cu_seqlens_k=k_sequence_lens,
+                                           max_seqlen_q=q.shape[2], max_seqlen_k=k.shape[2], dropout_p=self.dropout.p,
+                                           causal=self.causal)
+            out = rearrange(out, '(b s) h d -> b h s d', b=b)
+            out = out.to(orig_dtype)
+        else:
+            kv_einsum_eq = 'b h j d' if not self.one_kv_head else 'b j d'
 
-        if exists(prev_attn):
-            dots = dots + prev_attn
+            dots = einsum(f'b h i d, {kv_einsum_eq} -> b h i j', q, k) * scale
 
-        pre_softmax_attn = dots.clone()
+            mask_value = max_neg_value(dots)
 
-        if talking_heads:
-            dots = self.pre_softmax_talking_heads(dots)
+            if exists(prev_attn):
+                dots = dots + prev_attn
 
-        if exists(rel_pos):
-            dots = rel_pos(dots)
+            pre_softmax_attn = dots.clone()
 
-        if exists(input_mask):
-            dots.masked_fill_(~input_mask, mask_value)
-            del input_mask
+            if talking_heads:
+                dots = self.pre_softmax_talking_heads(dots)
 
-        if exists(attn_mask):
-            assert 2 <= attn_mask.ndim <= 4, 'attention mask must have greater than 2 dimensions but less than or equal to 4'
-            if attn_mask.ndim == 2:
-                attn_mask = rearrange(attn_mask, 'i j -> 1 1 i j')
-            elif attn_mask.ndim == 3:
-                attn_mask = rearrange(attn_mask, 'h i j -> 1 h i j')
-            dots.masked_fill_(~attn_mask, mask_value)
+            if exists(rel_pos):
+                dots = rel_pos(dots)
 
-        if exists(self.max_attend_past):
-            i, j = dots.shape[-2:]
-            range_q = torch.arange(j - i, j, device = device)
-            range_k = torch.arange(j, device = device)
-            dist = rearrange(range_q, 'i -> 1 1 i 1') - rearrange(range_k, 'j -> 1 1 1 j')
-            mask = dist > self.max_attend_past
-            dots.masked_fill_(mask, mask_value)
-            del mask
+            if exists(input_mask):
+                dots.masked_fill_(~input_mask, mask_value)
+                del input_mask
 
-        if self.causal:
-            i, j = dots.shape[-2:]
-            range_i = torch.arange(i, device = device)
-            mask = rearrange(range_i, 'i -> 1 1 i 1') < rearrange(range_i, 'j -> 1 1 1 j')
-            mask = F.pad(mask, (j - i, 0), value = False)
-            dots.masked_fill_(mask, mask_value)
-            del mask
+            if exists(attn_mask):
+                assert 2 <= attn_mask.ndim <= 4, 'attention mask must have greater than 2 dimensions but less than or equal to 4'
+                if attn_mask.ndim == 2:
+                    attn_mask = rearrange(attn_mask, 'i j -> 1 1 i j')
+                elif attn_mask.ndim == 3:
+                    attn_mask = rearrange(attn_mask, 'h i j -> 1 h i j')
+                dots.masked_fill_(~attn_mask, mask_value)
 
-        if exists(self.sparse_topk) and self.sparse_topk < dots.shape[-1]:
-            top, _ = dots.topk(self.sparse_topk, dim = -1)
-            vk = top[..., -1].unsqueeze(-1).expand_as(dots)
-            mask = dots < vk
-            dots.masked_fill_(mask, mask_value)
-            del mask
+            if exists(self.max_attend_past):
+                i, j = dots.shape[-2:]
+                range_q = torch.arange(j - i, j, device = device)
+                range_k = torch.arange(j, device = device)
+                dist = rearrange(range_q, 'i -> 1 1 i 1') - rearrange(range_k, 'j -> 1 1 1 j')
+                mask = dist > self.max_attend_past
+                dots.masked_fill_(mask, mask_value)
+                del mask
 
-        dtype = dots.dtype
+            if self.causal:
+                i, j = dots.shape[-2:]
+                range_i = torch.arange(i, device = device)
+                mask = rearrange(range_i, 'i -> 1 1 i 1') < rearrange(range_i, 'j -> 1 1 1 j')
+                mask = F.pad(mask, (j - i, 0), value = False)
+                dots.masked_fill_(mask, mask_value)
+                del mask
 
-        attn = self.attn_fn(dots, dim = -1)
-        attn = attn.type(dtype)
+            if exists(self.sparse_topk) and self.sparse_topk < dots.shape[-1]:
+                top, _ = dots.topk(self.sparse_topk, dim = -1)
+                vk = top[..., -1].unsqueeze(-1).expand_as(dots)
+                mask = dots < vk
+                dots.masked_fill_(mask, mask_value)
+                del mask
 
-        post_softmax_attn = attn.clone()
+            dtype = dots.dtype
 
-        attn = self.dropout(attn)
+            attn = self.attn_fn(dots, dim = -1)
+            attn = attn.type(dtype)
 
-        if talking_heads:
-            attn = self.post_softmax_talking_heads(attn)
+            post_softmax_attn = attn.clone()
 
-        out = einsum(f'b h i j, {kv_einsum_eq} -> b h i d', attn, v)
+            attn = self.dropout(attn)
+
+            if talking_heads:
+                attn = self.post_softmax_talking_heads(attn)
+
+            out = einsum(f'b h i j, {kv_einsum_eq} -> b h i d', attn, v)
 
         if exists(r):
             # https://arxiv.org/abs/2208.06061 proposes to add a residual for better gradients
@@ -764,10 +796,14 @@ class Attention(nn.Module):
             gates = self.to_v_gate(x)
             out = out * gates.sigmoid()
 
-        intermediates = Intermediates(
-            pre_softmax_attn = pre_softmax_attn,
-            post_softmax_attn = post_softmax_attn
-        )
+        if self.use_flash_attn:
+            # Not supported by flash attention.
+            intermediates = None
+        else:
+            intermediates = Intermediates(
+                pre_softmax_attn = pre_softmax_attn,
+                post_softmax_attn = post_softmax_attn
+            )
 
         if exists(self.sub_ln):
             out = self.sub_ln(out)
@@ -956,12 +992,14 @@ class AttentionLayers(nn.Module):
             deepnorm_init(self, init_gain)
 
     def _layer_fn(self, layer_type, layer_components, x, mems, rotary_pos_emb, prev_attn, mask, prev_cross_attn, context,
-                  attn_mask, context_mask):
+                  attn_mask, context_mask, return_hiddens):
         norm, block, residual_fn = layer_components
 
         if layer_type == 'a':
             layer_mem = mems.pop(0) if mems else None
             hidden = x
+        else:
+            hidden = None
 
         residual = x
 
@@ -977,14 +1015,12 @@ class AttentionLayers(nn.Module):
             out, inter = block(x, context=context, mask=mask, context_mask=context_mask, prev_attn=prev_cross_attn)
         elif layer_type == 'f':
             out = block(x)
+            inter = None
 
         if exists(post_branch_norm):
             out = post_branch_norm(out)
 
         x = residual_fn(out, residual)
-
-        if layer_type in ('a', 'c') and return_hiddens:
-            intermediates.append(inter)
 
         if layer_type == 'a' and self.residual_attn:
             prev_attn = inter.pre_softmax_attn
@@ -1025,11 +1061,12 @@ class AttentionLayers(nn.Module):
                 layer_fn = partial(checkpoint, self._layer_fn)
             else:
                 layer_fn = self._layer_fn
-            h, x, inter, prev_attn, prev_cross_attn = layer_fn(layer_type, layer_components, x, mems,
+            x, hidden, inter, prev_attn, prev_cross_attn = layer_fn(layer_type, layer_components, x, mems,
                                                                rotary_pos_emb, prev_attn, mask, prev_cross_attn,
-                                                               context, attn_mask, context_mask)
-            if return_hiddens:
-                hiddens.append(h)
+                                                               context, attn_mask, context_mask, return_hiddens)
+            if hidden is not None:
+                hiddens.append(hidden)
+            if inter is not None:
                 intermediates.append(inter)
 
         if return_hiddens:
