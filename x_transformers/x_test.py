@@ -37,10 +37,16 @@ def test_flash(style_name, extra_fwd_inputs={}, **kwargs):
 
 
 def test_all_flash_styles():
-    #test_flash('encoder')
-    #test_flash('decoder', causal=True)
+    test_flash('encoder')
+    test_flash('decoder', causal=True)
     test_flash('cross_attend', causal=True, cross_attend=True,
                extra_fwd_inputs=dict(context=torch.randn(8, 2048, 1024).cuda()))
+
+
+def test_checkpointing():
+    inp = torch.randn(8, 1024, 1024).cuda()
+    xf_normal = AttentionLayers(dim=1024, depth=8, heads=1024//64, enable_checkpointing=True).cuda()
+    xf_normal(inp).mean().backward()
 
 
 if __name__ == '__main__':

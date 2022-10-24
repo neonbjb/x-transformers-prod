@@ -9,8 +9,7 @@ from collections import namedtuple
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 from torch.utils import checkpoint
-
-from autoregressive_wrapper import AutoregressiveWrapper
+import x_transformers
 
 # constants
 
@@ -991,8 +990,8 @@ class AttentionLayers(nn.Module):
             init_gain = (8 * depth) ** -0.25
             deepnorm_init(self, init_gain)
 
-    def _layer_fn(self, layer_type, layer_components, x, mems, rotary_pos_emb, prev_attn, mask, prev_cross_attn, context,
-                  attn_mask, context_mask, return_hiddens):
+    def _layer_fn(self, x, rotary_pos_emb, prev_attn, mask, prev_cross_attn, context, attn_mask, context_mask,
+                  mems, layer_type, layer_components, stash_fn):
         norm, block, residual_fn = layer_components
 
         if layer_type == 'a':
@@ -1022,6 +1021,8 @@ class AttentionLayers(nn.Module):
 
         x = residual_fn(out, residual)
 
+        prev_attn = None
+        prev_cross_attn = None
         if layer_type == 'a' and self.residual_attn:
             prev_attn = inter.pre_softmax_attn
         elif layer_type == 'c' and self.cross_residual_attn:
@@ -1030,7 +1031,11 @@ class AttentionLayers(nn.Module):
         if exists(post_main_norm):
             x = post_main_norm(x)
 
-        return x, hidden, inter, prev_attn, prev_cross_attn
+        # This is a horribly messy way to return values to the caller while bypassing torch.checkpoint's interceptor.
+        # Sorry, reader. I don't think there is a better way.
+        stash_fn(hidden, inter)
+
+        return x, prev_attn, prev_cross_attn
 
     def forward(
         self,
@@ -1057,13 +1062,20 @@ class AttentionLayers(nn.Module):
             rotary_pos_emb = self.rotary_pos_emb(max_rotary_emb_length, x.device)
 
         for ind, (layer_type, layer_components) in enumerate(zip(self.layer_types, self.layers)):
+
+            # This horrible mess is needed to support gradient checkpointing for this very complex function call.
+            retrieved = []
+            def retrieval_fn(hidden, inter):
+                retrieved.extend([hidden, inter])
+            layer_fn = partial(self._layer_fn, layer_type=layer_type, layer_components=layer_components, mems=mems, stash_fn=retrieval_fn)
             if self.enable_checkpointing:
-                layer_fn = partial(checkpoint, self._layer_fn)
-            else:
-                layer_fn = self._layer_fn
-            x, hidden, inter, prev_attn, prev_cross_attn = layer_fn(layer_type, layer_components, x, mems,
-                                                               rotary_pos_emb, prev_attn, mask, prev_cross_attn,
-                                                               context, attn_mask, context_mask, return_hiddens)
+                assert all(map(lambda m: not exists(m), mems)), 'checkpointing is not supported with mems'
+                layer_fn = partial(checkpoint.checkpoint, layer_fn)
+            x, prev_attn_, prev_cross_attn_ = layer_fn(x, rotary_pos_emb, prev_attn, mask, prev_cross_attn,
+                                                                    context, attn_mask, context_mask)
+            prev_attn = prev_attn if prev_attn_ is None else prev_attn_
+            prev_cross_attn = prev_cross_attn if prev_cross_attn_ is None else prev_cross_attn_
+            hidden, inter = retrieved
             if hidden is not None:
                 hiddens.append(hidden)
             if inter is not None:
@@ -1221,14 +1233,16 @@ class TransformerWrapper(nn.Module):
         prepend_embeds = None,
         **kwargs
     ):
-        b, n, device, num_mem, emb_frac_gradient = *x.shape, x.device, self.num_memory_tokens, self.emb_frac_gradient
+        b, n, device, num_mem, emb_frac_gradient = *x.shape[:2], x.device, self.num_memory_tokens, self.emb_frac_gradient
         return_hiddens = return_mems | return_attn
 
         # absolute positional embedding
 
         external_pos_emb = exists(pos) and pos.dtype != torch.long
         pos_emb = self.pos_emb(x, pos = pos) if not external_pos_emb else pos
-        x = self.token_emb(x) + pos_emb
+        if len(x.shape) == 2:
+            x = self.token_emb(x)
+        x = x + pos_emb
 
         # post embedding norm, purportedly leads to greater stabilization
 
@@ -1400,7 +1414,7 @@ class XTransformer(nn.Module):
         if tie_token_emb:
             self.decoder.token_emb = self.encoder.token_emb
 
-        self.decoder = AutoregressiveWrapper(self.decoder, ignore_index=ignore_index, pad_value=pad_value)
+        self.decoder = x_transformers.AutoregressiveWrapper(self.decoder, ignore_index=ignore_index, pad_value=pad_value)
 
     @torch.no_grad()
     def generate(self, seq_in, seq_out_start, seq_len, src_mask = None, src_attn_mask = None, **kwargs):
