@@ -1,13 +1,21 @@
 ## x-transformers
 
-[![PyPI version](https://badge.fury.io/py/x-transformers.svg)](https://badge.fury.io/py/x-transformers)
+This is a fork of [x-transformers](https://github.com/neonbjb/x-transformers) with modifications to support high
+utilization of enterprise-grade GPUs and usage on diverse modalities. Specifically:
 
-A concise but fully-featured transformer, complete with a set of promising e**x**perimental features from various papers.
+* Special attention is paid to ensure compatibility and stability with FP16
+* [FasterTransformer](https://github.com/NVIDIA/FasterTransformer) support for >2x training performance boost
+* Gradient checkpointing support
+* Support for various novel attention masking patterns (e.g. Swin, Axial) and optimizations for sparse attention when 
+* using them (soon!)
+* kv-cached decoding of autoregressive models
 
 ## Install
 
 ```bash
-$ pip install x-transformers
+$ git clone https://github.com/neonbjb/x-transformers-prod.git
+$ cd x-transformers-prod
+$ pip install -e .
 ```
 
 ## Usage
